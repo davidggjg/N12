@@ -6,7 +6,7 @@ import threading
 import requests
 from flask import Flask, jsonify
 
-# הגדרת לוגים כדי שנוכל לראות הכל ב-Logs ב-Render
+# הגדרת לוגים
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -17,7 +17,7 @@ MAKO_URL = "https://www.mako.co.il/mako-vod-live-tv/VOD-6540b8dcb64fd31006.htm"
 CACHE_TTL = 540 # 9 דקות
 PORT = int(os.getenv("PORT", 10000))
 
-# יצירת Session עם Headers של דפדפן אמיתי (כדי לעקוף חסימות)
+# יצירת Session עם Headers של דפדפן אמיתי
 session = requests.Session()
 session.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
@@ -38,14 +38,10 @@ def get_fresh_link():
         logger.info("--- מנסה למשוך לינק חדש ממאקו ---")
         response = session.get(MAKO_URL, timeout=15)
         
-        # לוגים לבדיקה - אם זה נכשל, נדע למה
-        logger.info(f"Status Code: {response.status_code}")
-        
         if response.status_code != 200:
-            logger.error("קיבלנו סטטוס שגיאה ממאקו!")
+            logger.error(f"שגיאת HTTP: {response.status_code}")
             return None
 
-        # חיפוש הלינק בטקסט
         match = re.search(r'(https?://[^\s"\']+\.m3u8[^\s"\']*)', response.text)
         
         if match:
@@ -53,15 +49,14 @@ def get_fresh_link():
             logger.info(f"מצאתי לינק! {link}")
             return link
         else:
-            logger.error("לא מצאתי את הלינק בתוך הדף! (אולי האתר השתנה)")
+            logger.error("לא מצאתי את הלינק בתוך הדף!")
             return None
-
     except Exception as e:
-        logger.error(f"שגיאה כללית בחיבור למאקו: {e}")
+        logger.error(f"שגיאה כללית: {e}")
         return None
 
 def background_refresher():
-    """רענון הלינק ברקע בלי להפריע לגולשים"""
+    """רענון הלינק ברקע"""
     while True:
         new_link = get_fresh_link()
         with cache["lock"]:
@@ -80,7 +75,6 @@ def get_live():
         if cache["url"]:
             return jsonify({"stream_url": cache["url"]})
         else:
-            # אם הלינק ריק, ננסה למשוך שוב ברגע זה
             new_link = get_fresh_link()
             if new_link:
                 cache["url"] = new_link
@@ -92,18 +86,35 @@ def play():
     return """
     <html>
         <head><title>Live N12</title><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
-        <body style="margin:0; background:black; display:flex; justify-content:center; align-items:center; height:100vh;">
-            <video id="v" controls playsinline muted autoplay style="width:100%; max-width:900px;"></video>
+        <body style="margin:0; background:black; display:flex; justify-content:center; align-items:center; height:100vh; overflow:hidden; font-family:sans-serif;">
+            <div id="play-overlay" style="position:absolute; color:white; font-size:20px; cursor:pointer; z-index:10; background:rgba(0,0,0,0.7); padding:20px; border-radius:10px; border: 1px solid white;">לחץ כאן כדי להפעיל את השידור</div>
+            <video id="v" controls playsinline muted style="width:100%; max-height:100%;"></video>
             <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
             <script>
+                const v = document.getElementById('v');
+                const overlay = document.getElementById('play-overlay');
+
                 fetch('/live').then(r=>r.json()).then(d=>{
-                    if(d.error) return alert("השידור לא זמין כרגע - בדוק את ה-Logs ב-Render");
-                    var v = document.getElementById('v');
+                    if(!d.stream_url) {
+                        overlay.innerText = "השידור לא זמין כרגע, נסה שוב מאוחר יותר";
+                        return;
+                    }
                     var h = new Hls();
                     h.loadSource(d.stream_url);
                     h.attachMedia(v);
-                    v.play();
+                    h.on(Hls.Events.MANIFEST_PARSED, function() {
+                        v.play().then(() => {
+                            overlay.style.display = 'none';
+                        }).catch(() => {
+                            console.log("Autoplay blocked, user interaction required");
+                        });
+                    });
                 });
+
+                overlay.onclick = function() {
+                    v.play();
+                    overlay.style.display = 'none';
+                };
             </script>
         </body>
     </html>
