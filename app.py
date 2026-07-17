@@ -4,7 +4,8 @@ import re
 import logging
 import threading
 import requests
-from flask import Flask, jsonify, Response
+from urllib.parse import urljoin, urlparse, quote, unquote
+from flask import Flask, jsonify, Response, request
 
 # הגדרת לוגים
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -108,6 +109,93 @@ def get_live():
         return jsonify({"error": "Internal error"}), 500
 
 
+def _proxy_headers():
+    return {
+        "User-Agent": session.headers["User-Agent"],
+        "Referer": "https://www.mako.co.il/",
+        "Accept-Language": session.headers["Accept-Language"],
+    }
+
+
+@app.route('/manifest', methods=['GET'])
+def manifest():
+    """
+    מושך את קובץ ה-m3u8 בצד השרת (כאן מותר לנו לשלוח Referer אמיתי)
+    ומשכתב כל שורת URL בתוכו כך שתעבור דרך /segment - כדי לעקוף
+    את חסימת ה-hotlink/CORS של מאקו, שלא ניתן לעקוף מהדפדפן עצמו.
+    """
+    with cache_lock:
+        stream_url = cache["url"]
+
+    if not stream_url:
+        if not update_cache_if_possible():
+            return jsonify({"error": "No stream available"}), 503
+        with cache_lock:
+            stream_url = cache["url"]
+
+    try:
+        resp = session.get(stream_url, headers=_proxy_headers(), timeout=REQUEST_TIMEOUT)
+        if resp.status_code != 200:
+            logger.warning(f"מניפסט חזר עם סטטוס {resp.status_code}")
+            return jsonify({"error": "Manifest fetch failed"}), 502
+
+        base_url = stream_url
+        rewritten_lines = []
+        for line in resp.text.splitlines():
+            stripped = line.strip()
+            if stripped and not stripped.startswith('#'):
+                # שורה עם URL (סגמנט .ts או פלייליסט וריאנט .m3u8) - יכול להיות יחסי או מוחלט
+                absolute = urljoin(base_url, stripped)
+                proxied = f"/segment?url={quote(absolute, safe='')}"
+                rewritten_lines.append(proxied)
+            else:
+                rewritten_lines.append(line)
+
+        rewritten_body = "\n".join(rewritten_lines)
+        return Response(rewritten_body, mimetype='application/vnd.apple.mpegurl')
+    except requests.RequestException as e:
+        logger.error(f"שגיאה במשיכת מניפסט: {e}")
+        return jsonify({"error": "Manifest fetch error"}), 502
+
+
+@app.route('/segment', methods=['GET'])
+def segment():
+    """פרוקסי גנרי לסגמנטים/וריאנטים - מושך מהיעד עם headers תקינים ומחזיר את הבייטים."""
+    target = request.args.get('url')
+    if not target:
+        return jsonify({"error": "Missing url param"}), 400
+
+    parsed = urlparse(target)
+    if parsed.scheme not in ('http', 'https') or 'mako.co.il' not in parsed.netloc:
+        # מגן מפני שימוש בפרוקסי הזה לכתובות שרירותיות (open proxy)
+        return jsonify({"error": "Domain not allowed"}), 403
+
+    try:
+        upstream = session.get(target, headers=_proxy_headers(), timeout=REQUEST_TIMEOUT, stream=True)
+        if upstream.status_code != 200:
+            return jsonify({"error": f"Upstream returned {upstream.status_code}"}), 502
+
+        content_type = upstream.headers.get('Content-Type', 'application/octet-stream')
+
+        # אם זה עוד פלייליסט (וריאנט), נשכתב גם אותו כמו /manifest
+        if target.endswith('.m3u8') or 'mpegurl' in content_type:
+            rewritten_lines = []
+            for line in upstream.text.splitlines():
+                stripped = line.strip()
+                if stripped and not stripped.startswith('#'):
+                    absolute = urljoin(target, stripped)
+                    rewritten_lines.append(f"/segment?url={quote(absolute, safe='')}")
+                else:
+                    rewritten_lines.append(line)
+            return Response("\n".join(rewritten_lines), mimetype='application/vnd.apple.mpegurl')
+
+        # סגמנט וידאו רגיל (.ts / .m4s) - מחזירים כמו שהוא
+        return Response(upstream.iter_content(chunk_size=8192), content_type=content_type)
+    except requests.RequestException as e:
+        logger.error(f"שגיאה בפרוקסי סגמנט: {e}")
+        return jsonify({"error": "Segment fetch error"}), 502
+
+
 @app.route('/health', methods=['GET'])
 def health():
     with cache_lock:
@@ -133,29 +221,21 @@ def play():
                 const overlay = document.getElementById('play-overlay');
 
                 function loadStream() {
-                    fetch('/live').then(r => r.json()).then(d => {
-                        if (!d.stream_url) {
-                            overlay.innerText = "השידור לא זמין כרגע - נסי לרענן בעוד רגע";
-                            return;
+                    // חשוב: טוענים דרך /manifest (פרוקסי בצד השרת) ולא ישירות מול מאקו -
+                    // כי דפדפנים לא מאפשרים לג'אווהסקריפט לשנות את header ה-Referer,
+                    // וללא Referer תקין מאקו חוסם את הבקשה (403). השרת כן יכול לשלוח Referer אמיתי.
+                    var h = new Hls();
+                    h.loadSource('/manifest');
+                    h.attachMedia(v);
+                    h.on(Hls.Events.MANIFEST_PARSED, function() {
+                        v.play().catch(() => console.log("ממתין לאינטראקציה של המשתמש"));
+                    });
+                    h.on(Hls.Events.ERROR, function(event, data) {
+                        if (data.fatal) {
+                            console.error("שגיאת HLS קריטית, מנסה לטעון מחדש בעוד 5 שניות", data);
+                            h.destroy();
+                            setTimeout(loadStream, 5000);
                         }
-                        var h = new Hls({
-                            xhrSetup: function(xhr) {
-                                xhr.setRequestHeader('Referer', 'https://www.mako.co.il/');
-                            }
-                        });
-                        h.loadSource(d.stream_url);
-                        h.attachMedia(v);
-                        h.on(Hls.Events.MANIFEST_PARSED, function() {
-                            v.play().catch(() => console.log("ממתין לאינטראקציה של המשתמש"));
-                        });
-                        h.on(Hls.Events.ERROR, function(event, data) {
-                            if (data.fatal) {
-                                console.error("שגיאת HLS קריטית, מנסה לטעון מחדש בעוד 5 שניות", data);
-                                setTimeout(loadStream, 5000);
-                            }
-                        });
-                    }).catch(() => {
-                        overlay.innerText = "שגיאה בטעינת השידור";
                     });
                 }
 
