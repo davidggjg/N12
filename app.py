@@ -125,18 +125,18 @@ def _proxy_headers():
 @app.route('/manifest', methods=['GET'])
 def manifest():
     """
-    מושך את קובץ ה-m3u8 בצד השרת (כאן מותר לנו לשלוח Referer אמיתי)
-    ומשכתב כל שורת URL בתוכו כך שתעבור דרך /segment - כדי לעקוף
-    את חסימת ה-hotlink/CORS של מאקו, שלא ניתן לעקוף מהדפדפן עצמו.
+    תמיד מושך טוקן/קישור חדש-חדש ממאקו ברגע הבקשה עצמה - לא סומכים על
+    המטמון כי הטוקנים של מאקו כנראה זמניים וקצרי-טווח. כך שהקישור שהמשתמש
+    רואה (/manifest, /play) נשאר קבוע לנצח, גם כשהטוקן מאחורי הקלעים מתחלף.
     """
-    with cache_lock:
-        stream_url = cache["url"]
-
+    stream_url = get_fresh_link()
     if not stream_url:
-        if not update_cache_if_possible():
-            return jsonify({"error": "No stream available"}), 503
-        with cache_lock:
-            stream_url = cache["url"]
+        return jsonify({"error": "No stream available"}), 503
+
+    # מעדכנים גם את המטמון לצורך /health ו-/live (לא קריטי לפעולה עצמה)
+    with cache_lock:
+        cache["url"] = stream_url
+        cache["last_updated"] = time.time()
 
     try:
         resp = session.get(stream_url, headers=_proxy_headers(), timeout=REQUEST_TIMEOUT)
