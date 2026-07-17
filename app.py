@@ -26,7 +26,12 @@ session = requests.Session()
 session.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
     "Referer": "https://www.mako.co.il/",
-    "Accept-Language": "he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7"
+    "Accept-Language": "he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Origin": "https://www.mako.co.il",
+    "Accept": "*/*",
+    "Sec-Fetch-Site": "same-site",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Dest": "empty",
 })
 
 # ניהול Cache עם Lock נפרד (לא בתוך ה-dict עצמו, לניקיון)
@@ -137,7 +142,9 @@ def manifest():
         resp = session.get(stream_url, headers=_proxy_headers(), timeout=REQUEST_TIMEOUT)
         if resp.status_code != 200:
             logger.warning(f"מניפסט חזר עם סטטוס {resp.status_code}")
-            return jsonify({"error": "Manifest fetch failed"}), 502
+            logger.warning(f"תוכן תגובה (200 תווים ראשונים): {resp.text[:200]!r}")
+            logger.warning(f"headers של התגובה: {dict(resp.headers)}")
+            return jsonify({"error": "Manifest fetch failed", "upstream_status": resp.status_code}), 502
 
         base_url = stream_url
         rewritten_lines = []
